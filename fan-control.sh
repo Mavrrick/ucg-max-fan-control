@@ -25,7 +25,19 @@ DEFAULT_LEARNING_RATE=5        # PWM optimization step size
 # Create config file if it doesn't exist
 if [[ ! -f "$CONFIG_FILE" ]]; then
     logger -t fan-control "CONFIG: Creating new config file"
-    cat > "$CONFIG_FILE" <<-DEFAULTS
+
+    # Create directory if it doesn't exist
+    config_dir=$(dirname "$CONFIG_FILE")
+    if [[ ! -d "$config_dir" ]]; then
+        if ! mkdir -p "$config_dir" 2>/dev/null; then
+            logger -t fan-control "FATAL: Failed to create config directory: $config_dir"
+            exit 1
+        fi
+    fi
+
+    # Use a temporary file and atomic move to prevent partial writes
+    temp_config="${CONFIG_FILE}.tmp"
+    if ! cat > "$temp_config" <<-DEFAULTS 2>/dev/null; then
 MIN_PWM=$DEFAULT_MIN_PWM             # Minimum active fan speed (0-255)
 MAX_PWM=$DEFAULT_MAX_PWM            # Maximum fan speed (0-255)
 MIN_TEMP=$DEFAULT_MIN_TEMP            # Base threshold (°C)
@@ -40,15 +52,17 @@ DEADBAND=$DEFAULT_DEADBAND             # Temp stability threshold (°C)
 ALPHA=$DEFAULT_ALPHA               # Smoothing factor, lower values make the smoothed temp follow raw temp more closely (0-100)
 LEARNING_RATE=$DEFAULT_LEARNING_RATE        # PWM optimization step size
 DEFAULTS
+        logger -t fan-control "FATAL: Failed to write to temporary config file"
+        exit 1
+    elif ! mv "$temp_config" "$CONFIG_FILE" 2>/dev/null; then
+        logger -t fan-control "FATAL: Failed to create config file"
+        rm -f "$temp_config" 2>/dev/null  # Clean up the temporary file
+        exit 1
+    else
+        logger -t fan-control "CONFIG: New configuration file created successfully"
+    fi
 fi
 
-if locale -a | grep -q 'en_US.utf8'; then
-  export LANG=en_US.UTF-8
-  export LC_ALL=en_US.UTF-8
-else
-  export LANG=C.UTF-8
-  export LC_ALL=C.UTF-8
-fi
 
 # Source the config file
 source "$CONFIG_FILE" 2>/dev/null
@@ -96,17 +110,33 @@ if [ ${#missing_params[@]} -gt 0 ]; then
     temp_config="${CONFIG_FILE}.tmp"
 
     # Copy existing config to temp file
-    cp "$CONFIG_FILE" "$temp_config"
+    if ! cp "$CONFIG_FILE" "$temp_config" 2>/dev/null; then
+        logger -t fan-control "ERROR: Failed to create temporary config file for update"
+        # Continue with current in-memory values, but don't update the file
+    else
+        # Add each missing parameter
+        update_failed=false
+        for i in "${!missing_params[@]}"; do
+            if ! echo "${missing_params[$i]}=${missing_values[$i]}        ${missing_comments[$i]}" >> "$temp_config" 2>/dev/null; then
+                logger -t fan-control "ERROR: Failed to add parameter ${missing_params[$i]} to config file"
+                update_failed=true
+                break
+            fi
+        done
 
-    # Add each missing parameter
-    for i in "${!missing_params[@]}"; do
-        echo "${missing_params[$i]}=${missing_values[$i]}        ${missing_comments[$i]}" >> "$temp_config"
-    done
-
-    # Replace the original file with the updated one
-    mv "$temp_config" "$CONFIG_FILE"
-
-    logger -t fan-control "CONFIG: Configuration file updated successfully"
+        if [ "$update_failed" = true ]; then
+            logger -t fan-control "ERROR: Config file update failed"
+            rm -f "$temp_config" 2>/dev/null  # Clean up the temporary file
+        else
+            # Replace the original file with the updated one
+            if ! mv "$temp_config" "$CONFIG_FILE" 2>/dev/null; then
+                logger -t fan-control "ERROR: Failed to update config file"
+                rm -f "$temp_config" 2>/dev/null  # Clean up the temporary file
+            else
+                logger -t fan-control "CONFIG: Configuration file updated successfully"
+            fi
+        fi
+    fi
 fi
 
 # Validate configuration parameters
@@ -129,7 +159,7 @@ validate_config() {
 config_changed=false
 
 validate_config "MIN_PWM" "$MIN_PWM" 0 255 "$DEFAULT_MIN_PWM" || config_changed=true
-validate_config "MAX_PWM" "$MAX_PWM" "$MIN_PWM" 255 "$DEFAULT_MAX_PWM" || config_changed=true
+validate_config "MAX_PWM" "$MAX_PWM" "${MIN_PWM:-$DEFAULT_MIN_PWM}" 255 "$DEFAULT_MAX_PWM" || config_changed=true
 validate_config "MIN_TEMP" "$MIN_TEMP" 30 80 "$DEFAULT_MIN_TEMP" || config_changed=true
 validate_config "MAX_TEMP" "$MAX_TEMP" "$MIN_TEMP" 100 "$DEFAULT_MAX_TEMP" || config_changed=true
 validate_config "HYSTERESIS" "$HYSTERESIS" 1 15 "$DEFAULT_HYSTERESIS" || config_changed=true
@@ -148,7 +178,7 @@ if [ "$config_changed" = true ]; then
     temp_config="${CONFIG_FILE}.tmp"
 
     # Write corrected values to temp file
-    cat > "$temp_config" <<-CONFIG
+    if ! cat > "$temp_config" <<-CONFIG 2>/dev/null; then
 MIN_PWM=$MIN_PWM             # Minimum active fan speed (0-255)
 MAX_PWM=$MAX_PWM            # Maximum fan speed (0-255)
 MIN_TEMP=$MIN_TEMP            # Base threshold (°C)
@@ -163,11 +193,14 @@ DEADBAND=$DEADBAND             # Temp stability threshold (°C)
 ALPHA=$ALPHA               # Smoothing factor (0-100)
 LEARNING_RATE=$LEARNING_RATE        # PWM optimization step size
 CONFIG
-
-    # Replace the original file with the updated one
-    mv "$temp_config" "$CONFIG_FILE"
-
-    logger -t fan-control "CONFIG: Configuration file updated with corrected values"
+        logger -t fan-control "ERROR: Failed to write to temporary config file"
+        # Continue with current in-memory values, but don't update the file
+    elif ! mv "$temp_config" "$CONFIG_FILE" 2>/dev/null; then
+        logger -t fan-control "ERROR: Failed to update config file with corrected values"
+        rm -f "$temp_config" 2>/dev/null  # Clean up the temporary file
+    else
+        logger -t fan-control "CONFIG: Configuration file updated with corrected values"
+    fi
 fi
 
 # Derived values
@@ -216,17 +249,37 @@ fi
 ) 200>"$PID_FILE"
 
 ###[ CORE FUNCTIONALITY ]######################################################
-STATE_OFF=0
-STATE_TAPER=1
-STATE_ACTIVE=2
-STATE_EMERGENCY=3  # Added emergency state
+# State definitions
+STATE_OFF=0        # Fan completely off
+STATE_TAPER=1      # Cooling down period before turning off
+STATE_ACTIVE=2     # Normal operation with temperature-based fan speed
+STATE_EMERGENCY=3  # Critical temperature, maximum fan speed
+
+# Runtime variables
 CURRENT_STATE=$STATE_OFF
-TAPER_START=0
-LAST_PWM=-1
-SMOOTHED_TEMP=50
-LAST_ADJUSTMENT=0
-LAST_AVG_TEMP=0  # Track temperature for deadband calculations
+TAPER_START=0      # Timestamp when taper mode started
+LAST_PWM=-1        # Last PWM value set
+SMOOTHED_TEMP=50   # Current smoothed temperature
+LAST_ADJUSTMENT=0  # Timestamp of last PWM optimization
+LAST_AVG_TEMP=0    # Previous temperature (for deadband calculations)
 TEMP_READ_FAILURES=0  # Track consecutive temperature reading failures
+
+# Function to safely write to a file using atomic operations
+atomic_write_file() {
+    local target_file="$1"
+    local content="$2"
+    local temp_file="${target_file}.tmp"
+
+    if ! echo "$content" > "$temp_file" 2>/dev/null; then
+        logger -t fan-control "ERROR: Failed to write to temporary file for $target_file"
+        return 1
+    elif ! mv "$temp_file" "$target_file" 2>/dev/null; then
+        logger -t fan-control "ERROR: Failed to update file $target_file"
+        rm -f "$temp_file" 2>/dev/null  # Clean up the temporary file
+        return 1
+    fi
+    return 0
+}
 
 # Initialize smoothed temp from state file or raw temp
 raw_temp=$(ubnt-systool cputemp | awk '{print int($1)}' || echo 50)
@@ -237,18 +290,18 @@ if [[ -f "$TEMP_STATE_FILE" ]]; then
         # Don't use saved temp if it's too far from current raw temp (prevents large jumps)
         if (( ${saved_temp#-} - ${raw_temp#-} < 15 )); then
             SMOOTHED_TEMP=$saved_temp
-            logger -t fan-control "INIT: Loaded saved temp=${SMOOTHED_TEMP}℃ | Raw=${raw_temp}℃"
+            logger -t fan-control "INIT: Loaded saved temp=${SMOOTHED_TEMP}°C | Raw=${raw_temp}°C"
         else
             SMOOTHED_TEMP=$raw_temp
-            logger -t fan-control "INIT: Discarded saved temp=${saved_temp}℃ (too far from raw=${raw_temp}℃)"
+            logger -t fan-control "INIT: Discarded saved temp=${saved_temp}°C (too far from raw=${raw_temp}°C)"
         fi
     else
         SMOOTHED_TEMP=$raw_temp
-        logger -t fan-control "INIT: Invalid saved temp=${saved_temp}℃, using raw=${raw_temp}℃"
+        logger -t fan-control "INIT: Invalid saved temp=${saved_temp}°C, using raw=${raw_temp}°C"
     fi
 else
     SMOOTHED_TEMP=$raw_temp
-    logger -t fan-control "INIT: No saved temp, using raw=${raw_temp}℃"
+    logger -t fan-control "INIT: No saved temp, using raw=${raw_temp}°C"
 fi
 
 get_smoothed_temp() {
@@ -286,24 +339,25 @@ get_smoothed_temp() {
     raw_temp=${raw_temp:-50}
     local previous=$SMOOTHED_TEMP
 
-    # Calculate new smoothed temperature
-    SMOOTHED_TEMP=$(( (ALPHA * SMOOTHED_TEMP + (100 - ALPHA) * raw_temp ) / 100 ))
+    # Calculate new smoothed temperature using exponential smoothing formula:
+    # smoothed_temp = (α × previous_smooth + (100 - α) × raw_temp) / 100
+    # where α (ALPHA) controls how much weight to give to previous vs. new readings
+    # Use awk for floating-point arithmetic to prevent drift from integer rounding
+    SMOOTHED_TEMP=$(awk "BEGIN { printf \"%.0f\", ($ALPHA * $SMOOTHED_TEMP + (100 - $ALPHA) * $raw_temp) / 100 }")
 
     # Safety check: If raw and smoothed temps differ by more than 20°C, reset smoothed temp
     local temp_diff=$((raw_temp - SMOOTHED_TEMP))
     if (( ${temp_diff#-} > 20 )); then
-        logger -t fan-control "ALERT: Large temp difference detected (${temp_diff}℃) - resetting smoothed temp"
+        logger -t fan-control "ALERT: Large temp difference detected (${temp_diff}°C) - resetting smoothed temp"
         SMOOTHED_TEMP=$raw_temp
     fi
 
     # Save smoothed temp to state file (only if it changed significantly)
     if (( ${SMOOTHED_TEMP#-} - ${previous#-} != 0 )); then
-        # Use a temporary file and atomic move to prevent partial writes
-        temp_file="${TEMP_STATE_FILE}.tmp"
-        echo "$SMOOTHED_TEMP" > "$temp_file" && mv "$temp_file" "$TEMP_STATE_FILE"
+        atomic_write_file "$TEMP_STATE_FILE" "$SMOOTHED_TEMP"
     fi
 
-    logger -t fan-control "TEMP:  RAW=${raw_temp}℃ | SMOOTH=${SMOOTHED_TEMP}℃ | DELTA=$((raw_temp - SMOOTHED_TEMP))℃"
+    logger -t fan-control "TEMP:  RAW=${raw_temp}°C | SMOOTH=${SMOOTHED_TEMP}°C | DELTA=$((raw_temp - SMOOTHED_TEMP))°C"
     echo $SMOOTHED_TEMP
 }
 
@@ -312,12 +366,19 @@ calculate_speed() {
     local temp_range=$((MAX_TEMP - FAN_ACTIVATION_TEMP))
     local temp_diff=$((avg_temp - FAN_ACTIVATION_TEMP))
 
+    # Prevent division by zero
     (( temp_range > 0 )) || temp_range=1
+
+    # Quadratic response curve calculation:
+    # PWM = MIN_PWM + (temp_diff²/temp_range²) * (MAX_PWM - MIN_PWM)
+    # The formula is multiplied by 20 and divided by 10 to improve integer math precision
     local speed=$(( (temp_diff * temp_diff * (MAX_PWM - MIN_PWM) * 20) / (temp_range * temp_range * 10) ))
     speed=$(( speed + MIN_PWM ))
+
+    # Ensure speed doesn't exceed MAX_PWM
     speed=$(( speed > MAX_PWM ? MAX_PWM : speed ))
 
-    logger -t fan-control "CALC: temp_diff=${temp_diff}℃ | range=${temp_range}℃ | speed=${speed}pwm"
+    logger -t fan-control "CALC: temp_diff=${temp_diff}°C | range=${temp_range}°C | speed=${speed}pwm"
     echo $speed
 }
 
@@ -330,7 +391,7 @@ set_fan_speed() {
     # Emergency override
     if (( current_temp >= MAX_TEMP )); then
         new_speed=$MAX_PWM
-        reason="EMERGENCY: Temp ${current_temp}℃ ≥ ${MAX_TEMP}℃"
+        reason="EMERGENCY: Temp ${current_temp}°C ≥ ${MAX_TEMP}°C"
     fi
 
     # Special handling for OFF state
@@ -355,14 +416,26 @@ set_fan_speed() {
     if [[ "$new_speed" -ne "$LAST_PWM" ]]; then
         # Note: Due to hardware limitations, the actual PWM value applied may differ from the requested value
         # (e.g., setting 50 might result in ~48, or 100 might result in ~92)
-        echo "$new_speed" > "$FAN_PWM_DEVICE"
-        logger -t fan-control "SET: ${LAST_PWM}→${new_speed}pwm | Reason: ${reason}"
-        LAST_PWM=$new_speed
-        LAST_AVG_TEMP=$current_temp  # Reset deadband tracking on change
+        if ! echo "$new_speed" > "$FAN_PWM_DEVICE" 2>/dev/null; then
+            logger -t fan-control "ERROR: Failed to write to PWM device $FAN_PWM_DEVICE"
+            # Check if device still exists
+            if [[ ! -e "$FAN_PWM_DEVICE" ]]; then
+                logger -t fan-control "FATAL: PWM device $FAN_PWM_DEVICE no longer exists"
+                # We can't continue without the PWM device, but we'll keep running to monitor temperature
+            elif [[ ! -w "$FAN_PWM_DEVICE" ]]; then
+                logger -t fan-control "FATAL: PWM device $FAN_PWM_DEVICE is no longer writable"
+                # We can't continue without write access, but we'll keep running to monitor temperature
+            fi
+        else
+            logger -t fan-control "SET: ${LAST_PWM}→${new_speed}pwm | Reason: ${reason}"
+            LAST_PWM=$new_speed
+            LAST_AVG_TEMP=$current_temp  # Reset deadband tracking on change
+        fi
 
         if (( CURRENT_STATE == STATE_ACTIVE )); then
             local now=$(date +%s)
             # More frequent learning for better adaptation (30 minutes instead of 1 hour)
+            # Check if it's time to adjust the optimal PWM value (every 30 minutes)
             if (( now - LAST_ADJUSTMENT > 1800 )); then
                 local optimal=$(cat "$OPTIMAL_PWM_FILE" 2>/dev/null || echo "$MIN_PWM")
                 # Validate optimal PWM value
@@ -389,15 +462,19 @@ set_fan_speed() {
                     adaptive_rate=$(( adaptive_rate < 1 ? 1 : adaptive_rate ))
                 fi
 
-                # Learning logic
+                # Enhanced learning logic with more responsive adjustments
                 # 1. If we're at optimal speed but temp is rising, increase PWM
                 # 2. If we're at optimal speed but temp is stable below MIN_TEMP, decrease PWM
                 # 3. If we're above optimal speed but temp is stable, try to decrease PWM
+                # 4. If temperature is rising rapidly, make larger adjustments
                 if (( new_speed == optimal )); then
                     if (( temp_delta > 0 && current_temp > MIN_TEMP )); then
                         # Temperature rising, increase PWM proactively
-                        adjustment="+${adaptive_rate} (rising temp ${temp_delta}℃)"
-                        optimal=$(( optimal + adaptive_rate ))
+                        # Scale adjustment based on how quickly temperature is rising
+                        local rise_factor=$(( temp_delta > 2 ? 2 : 1 ))
+                        local adj_amount=$(( adaptive_rate * rise_factor ))
+                        adjustment="+${adj_amount} (rising temp ${temp_delta}°C)"
+                        optimal=$(( optimal + adj_amount ))
                     elif (( current_temp < MIN_TEMP && temp_stability < DEADBAND * 2 )); then
                         # Temperature below threshold and stable, can reduce PWM
                         adjustment="-${adaptive_rate} (stable below threshold)"
@@ -408,16 +485,23 @@ set_fan_speed() {
                     # Try to gradually reduce optimal PWM to find the most efficient setting
                     adjustment="-1 (efficiency optimization)"
                     optimal=$(( optimal - 1 ))
+                # If we're below optimal speed but temperature is rising quickly
+                elif (( new_speed < optimal && temp_delta > DEADBAND * 2 )); then
+                    # Temperature rising quickly while below optimal speed - increase optimal
+                    adjustment="+${adaptive_rate} (rapid temp increase ${temp_delta}°C)"
+                    optimal=$(( optimal + adaptive_rate ))
                 fi
 
                 if [[ -n "$adjustment" ]]; then
+                    # Ensure optimal PWM stays within valid range
                     optimal=$(( optimal > MAX_PWM ? MAX_PWM : optimal ))
                     optimal=$(( optimal < MIN_PWM ? MIN_PWM : optimal ))
-                    # Use a temporary file and atomic move to prevent partial writes
-                    temp_file="${OPTIMAL_PWM_FILE}.tmp"
-                    echo "$optimal" > "$temp_file" && mv "$temp_file" "$OPTIMAL_PWM_FILE"
-                    LAST_ADJUSTMENT=$now
-                    logger -t fan-control "LEARNING: ${original_optimal}→${optimal}pwm (${adjustment}) [Rate=${adaptive_rate}]"
+
+                    # Use atomic write function to update the optimal PWM file
+                    if atomic_write_file "$OPTIMAL_PWM_FILE" "$optimal"; then
+                        LAST_ADJUSTMENT=$now
+                        logger -t fan-control "LEARNING: ${original_optimal}→${optimal}pwm (${adjustment}) [Rate=${adaptive_rate}]"
+                    fi
                 fi
             fi
         fi
@@ -433,7 +517,7 @@ update_fan_state() {
     # Check for emergency condition first
     if (( avg_temp >= MAX_TEMP )); then
         if (( CURRENT_STATE != STATE_EMERGENCY )); then
-            state_transition="→EMERGENCY (${avg_temp}℃ ≥ ${MAX_TEMP}℃)"
+            state_transition="→EMERGENCY (${avg_temp}°C ≥ ${MAX_TEMP}°C)"
             CURRENT_STATE=$STATE_EMERGENCY
             set_fan_speed $MAX_PWM
         else
@@ -446,7 +530,7 @@ update_fan_state() {
             $STATE_EMERGENCY)
                 # Exit emergency mode only when temperature drops significantly below MAX_TEMP
                 if (( avg_temp <= MAX_TEMP - HYSTERESIS )); then
-                    state_transition="EMERGENCY→ACTIVE (${avg_temp}℃ ≤ $((MAX_TEMP - HYSTERESIS))℃)"
+                    state_transition="EMERGENCY→ACTIVE (${avg_temp}°C ≤ $((MAX_TEMP - HYSTERESIS))°C)"
                     CURRENT_STATE=$STATE_ACTIVE
                     set_fan_speed $(calculate_speed $avg_temp)
                 else
@@ -457,7 +541,7 @@ update_fan_state() {
 
             $STATE_OFF)
                 if (( avg_temp >= FAN_ACTIVATION_TEMP )); then
-                    state_transition="OFF→ACTIVE (${avg_temp}℃ ≥ ${FAN_ACTIVATION_TEMP}℃)"
+                    state_transition="OFF→ACTIVE (${avg_temp}°C ≥ ${FAN_ACTIVATION_TEMP}°C)"
                     CURRENT_STATE=$STATE_ACTIVE
                     set_fan_speed $OPTIMAL_PWM
                 fi
@@ -465,7 +549,7 @@ update_fan_state() {
 
             $STATE_TAPER)
                 if (( avg_temp >= FAN_ACTIVATION_TEMP + 2 )); then  # Added 2°C buffer to prevent oscillation
-                    state_transition="TAPER→ACTIVE (${avg_temp}℃ ≥ $((FAN_ACTIVATION_TEMP + 2))℃)"
+                    state_transition="TAPER→ACTIVE (${avg_temp}°C ≥ $((FAN_ACTIVATION_TEMP + 2))°C)"
                     CURRENT_STATE=$STATE_ACTIVE
                     set_fan_speed $OPTIMAL_PWM
                 elif (( now - TAPER_START >= TAPER_DURATION )); then
@@ -474,21 +558,21 @@ update_fan_state() {
                     set_fan_speed 0
                 else
                     local remaining=$(( TAPER_DURATION - (now - TAPER_START) ))
-                    logger -t fan-control "TAPER: Remaining $((remaining / 60))m | Current: ${avg_temp}℃"
+                    logger -t fan-control "TAPER: Remaining $((remaining / 60))m | Current: ${avg_temp}°C"
                     set_fan_speed $MIN_PWM
                 fi
                 ;;
 
             $STATE_ACTIVE)
                 if (( avg_temp <= MIN_TEMP )); then
-                    state_transition="ACTIVE→TAPER (${avg_temp}℃ ≤ ${MIN_TEMP}℃)"
+                    state_transition="ACTIVE→TAPER (${avg_temp}°C ≤ ${MIN_TEMP}°C)"
                     CURRENT_STATE=$STATE_TAPER
                     TAPER_START=$now
                     set_fan_speed $MIN_PWM
                 else
                     local temp_delta=$(( avg_temp - LAST_AVG_TEMP ))
                     if (( ${temp_delta#-} > DEADBAND )); then
-                        logger -t fan-control "DEADBAND:  DELTA=${temp_delta}℃ | THRESHOLD=${DEADBAND}℃"
+                        logger -t fan-control "DEADBAND:  DELTA=${temp_delta}°C | THRESHOLD=${DEADBAND}°C"
                         local speed=$(calculate_speed $avg_temp)
                         set_fan_speed $speed
                     else
@@ -498,7 +582,7 @@ update_fan_state() {
                             logger -t fan-control "DEADBAND:  Forcing adjustment (current ${LAST_PWM}pwm < target ${target_speed}pwm)"
                             set_fan_speed $target_speed
                         else
-                            logger -t fan-control "DEADBAND:  No change | DELTA=${temp_delta}℃"
+                            logger -t fan-control "DEADBAND:  No change | DELTA=${temp_delta}°C"
                         fi
                     fi
                 fi
@@ -510,40 +594,57 @@ update_fan_state() {
 }
 
 ###[ MAIN EXECUTION ]##########################################################
+# Initialize optimal PWM file if it doesn't exist
 [[ -f "$OPTIMAL_PWM_FILE" ]] || {
-    # Use a temporary file and atomic move to prevent partial writes
-    temp_file="${OPTIMAL_PWM_FILE}.tmp"
-    echo "$MIN_PWM" > "$temp_file" && mv "$temp_file" "$OPTIMAL_PWM_FILE"
-    logger -t fan-control "INIT: Created optimal PWM file with ${MIN_PWM}pwm"
+    if atomic_write_file "$OPTIMAL_PWM_FILE" "$MIN_PWM"; then
+        logger -t fan-control "INIT: Created optimal PWM file with ${MIN_PWM}pwm"
+    fi
 }
 
+# Read and validate optimal PWM value
 OPTIMAL_PWM=$(cat "$OPTIMAL_PWM_FILE" 2>/dev/null || echo "$MIN_PWM")
-# Validate optimal PWM value
 if ! [[ "$OPTIMAL_PWM" =~ ^[0-9]+$ ]] || (( OPTIMAL_PWM < MIN_PWM || OPTIMAL_PWM > MAX_PWM )); then
     logger -t fan-control "WARNING: Invalid optimal PWM value: ${OPTIMAL_PWM}, using MIN_PWM"
     OPTIMAL_PWM=$MIN_PWM
-    # Write corrected value back to file using atomic write
-    temp_file="${OPTIMAL_PWM_FILE}.tmp"
-    echo "$OPTIMAL_PWM" > "$temp_file" && mv "$temp_file" "$OPTIMAL_PWM_FILE"
+
+    # Write corrected value back to file
+    if atomic_write_file "$OPTIMAL_PWM_FILE" "$OPTIMAL_PWM"; then
+        logger -t fan-control "FIXED: Updated optimal PWM file with corrected value ${OPTIMAL_PWM}pwm"
+    fi
 fi
-logger -t fan-control "START: Optimal=${OPTIMAL_PWM}pwm | Config: MIN=${MIN_TEMP}℃, MAX=${MAX_TEMP}℃, HYST=${HYSTERESIS}℃"
+logger -t fan-control "START: Optimal=${OPTIMAL_PWM}pwm | Config: MIN=${MIN_TEMP}°C, MAX=${MAX_TEMP}°C, HYST=${HYSTERESIS}°C"
 
 initial_temp=$(get_smoothed_temp)
 if (( initial_temp >= FAN_ACTIVATION_TEMP )); then
-    logger -t fan-control "COLDSTART: Initial temp ${initial_temp}℃ ≥ ${FAN_ACTIVATION_TEMP}℃"
+    logger -t fan-control "COLDSTART: Initial temp ${initial_temp}°C ≥ ${FAN_ACTIVATION_TEMP}°C"
     CURRENT_STATE=$STATE_ACTIVE
     set_fan_speed $OPTIMAL_PWM
 else
-    logger -t fan-control "COLDSTART: Initial temp ${initial_temp}℃ - Fans off"
+    logger -t fan-control "COLDSTART: Initial temp ${initial_temp}°C - Fans off"
     set_fan_speed 0
 fi
 
+# Define state names for more readable logging
+get_state_name() {
+    case $1 in
+        $STATE_OFF) echo "OFF" ;;
+        $STATE_TAPER) echo "TAPER" ;;
+        $STATE_ACTIVE) echo "ACTIVE" ;;
+        $STATE_EMERGENCY) echo "EMERGENCY" ;;
+        *) echo "UNKNOWN" ;;
+    esac
+}
+
+# Main loop
 declare -i loop_counter=0
 while true; do
     update_fan_state
 
+    # Log status every 10 iterations
     (( loop_counter++ % 10 == 0 )) && {
-        logger -t fan-control "STATUS: State=${CURRENT_STATE} | PWM=${LAST_PWM} | Temp=$(get_smoothed_temp)℃"
+        state_name=$(get_state_name $CURRENT_STATE)
+        current_temp=$(get_smoothed_temp)
+        logger -t fan-control "STATUS: State=${state_name} | PWM=${LAST_PWM} | Temp=${current_temp}°C"
     }
 
     sleep $CHECK_INTERVAL
